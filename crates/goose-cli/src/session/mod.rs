@@ -2101,9 +2101,10 @@ impl CliSession {
             .get_param::<bool>("GOOSE_CLI_SHOW_COST")
             .unwrap_or(false);
 
-        let provider_name = config
-            .get_goose_provider()
-            .unwrap_or_else(|_| "unknown".to_string());
+        // Resolve the provider name from the active session provider, not the
+        // global default, so cost estimates stay correct after `/model
+        // --provider` and when a session starts on a non-default provider.
+        let provider_name = provider.get_name().to_string();
 
         match self.get_session().await {
             Ok(metadata) => {
