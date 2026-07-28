@@ -80,7 +80,7 @@ fn should_clear_catalog_pricing(provider: &str) -> bool {
 }
 
 pub fn maybe_get_canonical_model(provider: &str, model: &str) -> Option<CanonicalModel> {
-    let registry = CanonicalModelRegistry::bundled().ok()?;
+    let registry = CanonicalModelRegistry::effective().ok()?;
 
     let canonical_id = map_to_canonical_model(provider, model, registry)?;
     let mut canonical = if let Some((canon_provider, canon_model)) = canonical_id.split_once('/') {
