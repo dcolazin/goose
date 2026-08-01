@@ -477,6 +477,47 @@ impl Gateway for TelegramGateway {
             OutgoingMessage::Typing => {
                 self.send_chat_action(chat_id, "typing").await?;
             }
+            OutgoingMessage::Document {
+                path,
+                filename,
+                caption,
+            } => {
+                const MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
+                let size = std::fs::metadata(&path)?.len();
+                if size > MAX_UPLOAD_BYTES {
+                    anyhow::bail!(
+                        "file {} is {} bytes, exceeding Telegram's 50 MB upload limit; \
+                         run a local Bot API server to send up to 2 GB",
+                        path.display(),
+                        size
+                    );
+                }
+                let fname = filename
+                    .clone()
+                    .or_else(|| {
+                        path.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "file".to_string());
+                let bytes = std::fs::read(&path)?;
+                let part = reqwest::multipart::Part::bytes(bytes).file_name(fname);
+                let mut form = reqwest::multipart::Form::new()
+                    .text("chat_id", chat_id.to_string())
+                    .part("document", part);
+                if let Some(c) = caption {
+                    form = form.text("caption", c.clone());
+                }
+                let resp = self
+                    .client
+                    .post(self.api_url("sendDocument"))
+                    .multipart(form)
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    anyhow::bail!("Telegram sendDocument failed: {}", resp.status());
+                }
+            }
         }
 
         Ok(())

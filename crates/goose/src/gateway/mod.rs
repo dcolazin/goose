@@ -7,6 +7,7 @@ pub mod telegram_format;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 use handler::GatewayHandler;
@@ -55,6 +56,14 @@ pub struct Attachment {
 pub enum OutgoingMessage {
     Text { body: String },
     Typing,
+    /// Send a file as a document. The file at `path` is read from disk and
+    /// uploaded. `filename` overrides the displayed name; `caption` is optional.
+    /// Gateways that can't send files should ignore this variant.
+    Document {
+        path: PathBuf,
+        filename: Option<String>,
+        caption: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
