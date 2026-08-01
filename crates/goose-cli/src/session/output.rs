@@ -1578,6 +1578,34 @@ pub fn display_cost_usage(provider: &str, model: &str, usage: &Usage) {
     }
 }
 
+/// Display a precomputed (accumulated) cost with a token breakdown. Unlike
+/// [`display_cost_usage`], this does not re-price past usage at the current
+/// model's rate: the cost is taken as-is (accumulated per turn at each turn's
+/// own rate), so it stays stable across model switches.
+pub fn display_accumulated_cost(cost: f64, usage: &Usage) {
+    use console::style;
+    let input_tokens = usage.input_tokens.unwrap_or(0);
+    let output_tokens = usage.output_tokens.unwrap_or(0);
+    let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+    let cache_write = usage.cache_write_input_tokens.unwrap_or(0);
+
+    let cache_breakdown = match (cache_read, cache_write) {
+        (0, 0) => String::new(),
+        (read, 0) => format!(" ({} cache read)", read),
+        (0, write) => format!(" ({} cache write)", write),
+        (read, write) => format!(" ({} cache read, {} cache write)", read, write),
+    };
+
+    eprintln!(
+        "Cost: {} USD ({} tokens: in {}{}, out {})",
+        style(format!("${:.4}", cost)).cyan(),
+        input_tokens + output_tokens,
+        input_tokens,
+        cache_breakdown,
+        output_tokens
+    );
+}
+
 pub struct McpSpinners {
     bars: HashMap<String, ProgressBar>,
     log_spinner: Option<ProgressBar>,

@@ -2113,11 +2113,19 @@ impl CliSession {
                 output::display_context_usage(total_tokens, context_limit);
 
                 if show_cost {
-                    output::display_cost_usage(
-                        &provider_name,
-                        &model_config.model_name,
-                        &metadata.usage,
-                    );
+                    // Use the incrementally-accumulated cost (each turn priced at
+                    // its own rate) so a model switch doesn't retroactively
+                    // re-price past usage. Fall back to a current-rate estimate
+                    // only when nothing was ever recorded.
+                    if let Some(cost) = metadata.accumulated_cost {
+                        output::display_accumulated_cost(cost, &metadata.accumulated_usage);
+                    } else {
+                        output::display_cost_usage(
+                            &provider_name,
+                            &model_config.model_name,
+                            &metadata.usage,
+                        );
+                    }
                 }
             }
             Err(_) => {
