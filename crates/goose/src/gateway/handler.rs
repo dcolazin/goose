@@ -729,6 +729,43 @@ impl GatewayHandler {
                 .await?;
         }
 
+        // Flush any files the agent wrote to the outbox dir, sending each as a
+        // document — the producer for OutgoingMessage::Document. Symlinks are
+        // skipped so the outbox can't be used to exfiltrate files outside it.
+        let outbox =
+            gateway_working_dir(&message.user.platform, &message.user.user_id).join("outbox");
+        if let Ok(entries) = std::fs::read_dir(&outbox) {
+            let mut files: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
+                .collect();
+            files.sort();
+            for file in files {
+                match self
+                    .gateway
+                    .send_message(
+                        &message.user,
+                        OutgoingMessage::Document {
+                            path: file.clone(),
+                            filename: None,
+                            caption: None,
+                        },
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&file);
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        path = %file.display(),
+                        "failed to send outbox file; leaving it for retry"
+                    ),
+                }
+            }
+        }
+
         Ok(())
     }
 }
