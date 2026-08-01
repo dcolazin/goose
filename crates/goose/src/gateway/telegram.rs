@@ -16,6 +16,12 @@ const MAX_VOICE_FILE_SIZE: i64 = 20 * 1024 * 1024;
 pub struct TelegramGateway {
     bot_token: String,
     client: Client,
+    /// Bot API base URL. Defaults to the cloud API; point at a local Bot API
+    /// server (e.g. http://localhost:8081) to enable uploads up to 2 GB.
+    api_base: String,
+    /// Per-file upload cap in bytes. 50 MB for the cloud API; raise it when
+    /// using a local Bot API server.
+    max_upload_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,11 +112,23 @@ impl TelegramGateway {
             .http1_only()
             .build()?;
 
-        Ok(Self { bot_token, client })
+        let api_base = config.platform_config["api_base"]
+            .as_str()
+            .unwrap_or(TELEGRAM_API_BASE)
+            .to_string();
+        let max_upload_mb = config.platform_config["max_upload_mb"].as_u64().unwrap_or(50);
+        let max_upload_bytes = max_upload_mb.saturating_mul(1024 * 1024);
+
+        Ok(Self {
+            bot_token,
+            client,
+            api_base,
+            max_upload_bytes,
+        })
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("{}/bot{}/{}", TELEGRAM_API_BASE, self.bot_token, method)
+        format!("{}/bot{}/{}", self.api_base, self.bot_token, method)
     }
 
     async fn get_updates(&self, offset: Option<i64>) -> anyhow::Result<Vec<TelegramUpdate>> {
@@ -228,7 +246,7 @@ impl TelegramGateway {
         // Step 2 – download raw bytes
         let download_url = format!(
             "{}/file/bot{}/{}",
-            TELEGRAM_API_BASE, self.bot_token, file_path
+            self.api_base, self.bot_token, file_path
         );
         let bytes = self.client.get(&download_url).send().await?.bytes().await?;
         Ok(bytes.to_vec())
@@ -482,14 +500,16 @@ impl Gateway for TelegramGateway {
                 filename,
                 caption,
             } => {
-                const MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
                 let size = std::fs::metadata(&path)?.len();
-                if size > MAX_UPLOAD_BYTES {
+                if size > self.max_upload_bytes {
                     anyhow::bail!(
-                        "file {} is {} bytes, exceeding Telegram's 50 MB upload limit; \
-                         run a local Bot API server to send up to 2 GB",
+                        "file {} is {} bytes, exceeding the upload limit of {} bytes \
+                         ({} MB); configure a local Bot API server and raise max_upload_mb \
+                         to send up to 2 GB",
                         path.display(),
-                        size
+                        size,
+                        self.max_upload_bytes,
+                        self.max_upload_bytes / 1024 / 1024
                     );
                 }
                 let fname = filename
