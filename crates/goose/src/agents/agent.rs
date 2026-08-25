@@ -44,6 +44,7 @@ use crate::agents::types::{
 use crate::agents::AgentEvent;
 use crate::config::extensions::name_to_key;
 use crate::config::permission::PermissionManager;
+use crate::config::paths::Paths;
 use crate::config::{get_enabled_extensions, Config, GooseMode};
 use crate::context_mgmt::{
     check_if_compaction_needed, compact_messages, DEFAULT_COMPACTION_THRESHOLD,
@@ -781,9 +782,10 @@ impl Agent {
         tool_inspection_manager.add_inspector(Box::new(EgressInspector::new()));
 
         // Add adversary inspector (LLM-based review, enabled by ~/.config/goose/adversary.md)
-        tool_inspection_manager.add_inspector(Box::new(AdversaryInspector::new(
-            provider.clone(),
+        // Uses main provider by default; override with GOOSE_ADVERSARY_PROVIDER / GOOSE_ADVERSARY_MODEL
+        tool_inspection_manager.add_inspector(Box::new(AdversaryInspector::with_config_dir(
             session_manager.clone(),
+            Paths::config_dir(),
         )));
 
         // Add permission inspector (medium-high priority)

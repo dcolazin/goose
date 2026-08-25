@@ -8,15 +8,33 @@ use crate::config::paths::Paths;
 use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageContent, ToolRequest};
 use crate::conversation::Conversation;
+use crate::model_config::model_config_from_user_config;
+use crate::providers::create;
 use crate::tool_inspection::{InspectionAction, InspectionResult, ToolInspector};
 use crate::utils::safe_truncate;
 
 const DEFAULT_TOOLS: &[&str] = &["shell"];
+const GOOSE_ADVERSARY_PROVIDER_ENV: &str = "GOOSE_ADVERSARY_PROVIDER";
+const GOOSE_ADVERSARY_MODEL_ENV: &str = "GOOSE_ADVERSARY_MODEL";
 
+/// Resolve the model config for the adversary inspector.
+///
+/// Precedence:
+/// 1. `GOOSE_ADVERSARY_PROVIDER` / `GOOSE_ADVERSARY_MODEL` env vars
+/// 2. Session model config (fallback for backward compat)
+/// 3. Global default provider/model
 async fn resolve_model_config(
     session_manager: &crate::session::SessionManager,
     session_id: &str,
 ) -> Result<goose_providers::model::ModelConfig> {
+    // Try adversary-specific env vars first
+    if let Ok(provider_name) = std::env::var(GOOSE_ADVERSARY_PROVIDER_ENV) {
+        if let Ok(model_name) = std::env::var(GOOSE_ADVERSARY_MODEL_ENV) {
+            return model_config_from_user_config(&provider_name, &model_name);
+        }
+    }
+
+    // Fall back to session model, then global default
     if !session_id.is_empty() {
         if let Ok(session) = session_manager.get_session(session_id, false).await {
             if let Some(model_config) = session.model_config {
@@ -32,7 +50,7 @@ async fn resolve_model_config(
     let model_name = config
         .get_goose_model()
         .map_err(|_| anyhow::anyhow!("missing model"))?;
-    crate::model_config::model_config_from_user_config(&provider_name, &model_name)
+    model_config_from_user_config(&provider_name, &model_name)
 }
 
 const DEFAULT_RULES: &str = r#"BLOCK if the command:
@@ -71,36 +89,85 @@ struct AdversaryConfig {
 /// If the file is absent, this inspector is disabled.
 /// If the review fails, the inspector fails open (allows the tool call).
 pub struct AdversaryInspector {
-    provider: SharedProvider,
     session_manager: Arc<crate::session::SessionManager>,
+    #[allow(dead_code)]
+    adversary_provider: Arc<OnceLock<Option<SharedProvider>>>,
+    adversary_model_config: Arc<OnceLock<Option<goose_providers::model::ModelConfig>>>,
     config: OnceLock<Option<AdversaryConfig>>,
     config_path: Option<std::path::PathBuf>,
 }
 
 impl AdversaryInspector {
     pub fn new(
-        provider: SharedProvider,
         session_manager: Arc<crate::session::SessionManager>,
     ) -> Self {
         Self {
-            provider,
             session_manager,
+            adversary_provider: Arc::new(OnceLock::new()),
+            adversary_model_config: Arc::new(OnceLock::new()),
             config: OnceLock::new(),
             config_path: None,
         }
     }
 
     pub fn with_config_dir(
-        provider: SharedProvider,
         session_manager: Arc<crate::session::SessionManager>,
         config_dir: std::path::PathBuf,
     ) -> Self {
         Self {
-            provider,
             session_manager,
+            adversary_provider: Arc::new(OnceLock::new()),
+            adversary_model_config: Arc::new(OnceLock::new()),
             config: OnceLock::new(),
             config_path: Some(config_dir.join("adversary.md")),
         }
+    }
+
+    /// Build the adversary provider (and cache it).
+    ///
+    /// Falls back to the main provider if the adversary-specific provider
+    /// cannot be created (auth, network, etc.).
+    async fn build_adversary_provider(
+        &self,
+    ) -> Option<Arc<dyn crate::providers::base::Provider>> {
+        let provider_name = std::env::var(GOOSE_ADVERSARY_PROVIDER_ENV).ok();
+        let model_name = std::env::var(GOOSE_ADVERSARY_MODEL_ENV).ok();
+
+        // If no adversary env vars set, return None (use main provider)
+        let (provider_name, model_name) = match (provider_name, model_name) {
+            (Some(p), Some(m)) => (p, m),
+            _ => return None,
+        };
+
+        let config = crate::config::Config::global();
+        let extensions = crate::config::extensions::get_enabled_extensions_with_config(config);
+
+        match create(&provider_name, extensions).await {
+            Ok(provider) => {
+                // Also resolve and cache the model config
+                let model_config = model_config_from_user_config(&provider_name, &model_name).ok();
+                let _ = self.adversary_model_config.set(model_config);
+                Some(provider)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to create adversary provider '{}': {} — will fall back to main model",
+                    provider_name, e
+                );
+                None
+            }
+        }
+    }
+
+    /// Get the cached adversary model config if available, otherwise resolve normally.
+    async fn get_model_config(&self) -> Result<goose_providers::model::ModelConfig> {
+        // Check if adversary-specific model config was created
+        if let Some(config) = self.adversary_model_config.get().and_then(|o| o.as_ref()) {
+            return Ok(config.clone());
+        }
+
+        // Fall back to resolve_model_config (session → global default)
+        resolve_model_config(&self.session_manager, "").await
     }
 
     fn get_config(&self) -> Option<&AdversaryConfig> {
@@ -276,12 +343,21 @@ impl AdversaryInspector {
         recent_messages: &[String],
         rules: &str,
     ) -> Result<(bool, String)> {
-        let provider_guard = self.provider.lock().await;
-        let provider = match provider_guard.clone() {
+        // Use adversary provider if configured, otherwise fall back to main
+        let provider = match self.build_adversary_provider().await {
             Some(p) => p,
-            None => return Ok((true, "No provider available".to_string())),
+            None => {
+                // Fall back to main provider (resolve from session/global)
+                let config = crate::config::Config::global();
+                let provider_name = config
+                    .get_goose_provider()
+                    .map_err(|_| anyhow::anyhow!("missing provider"))?;
+                let extensions = crate::config::extensions::get_enabled_extensions_with_config(config);
+                crate::providers::create(&provider_name, extensions)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to create fallback provider: {}", e))?
+            }
         };
-        drop(provider_guard);
 
         let history_section = if !recent_messages.is_empty() {
             let mut s = String::from("Recent user messages (oldest first):\n");
@@ -321,9 +397,7 @@ impl AdversaryInspector {
         )];
         let conversation = Conversation::new_unvalidated(check_messages);
 
-        let model_config = resolve_model_config(&self.session_manager, session_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Could not resolve model config: {}", e))?;
+        let model_config = self.get_model_config().await?;
         let (response, _usage) = crate::session_context::with_session_id(
             Some(session_id.to_string()),
             provider.complete(&model_config, system_prompt, conversation.messages(), &[]),
@@ -499,7 +573,6 @@ mod tests {
     use rmcp::model::CallToolRequestParams;
     use rmcp::object;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     #[test]
     fn test_parse_with_tools_frontmatter() {
@@ -683,12 +756,10 @@ mod tests {
     async fn test_disabled_when_no_adversary_md() {
         let tmp = tempfile::tempdir().unwrap();
 
-        let provider: SharedProvider = Arc::new(Mutex::new(None));
         let session_manager = Arc::new(crate::session::SessionManager::new(
             tmp.path().to_path_buf(),
         ));
         let inspector = AdversaryInspector::with_config_dir(
-            provider,
             session_manager,
             tmp.path().to_path_buf(),
         );
@@ -743,5 +814,57 @@ mod tests {
 
         let original = AdversaryInspector::extract_original_task(&messages);
         assert_eq!(original, "never delete files outside the repo");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_model_config_falls_back_to_session() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let session_manager = Arc::new(crate::session::SessionManager::new(
+            tmp.path().to_path_buf(),
+        ));
+
+        // Without adversary env vars and without session model config,
+        // it should fall back to global config
+        std::env::remove_var(GOOSE_ADVERSARY_PROVIDER_ENV);
+        std::env::remove_var(GOOSE_ADVERSARY_MODEL_ENV);
+
+        let result = resolve_model_config(&session_manager, "").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_model_config_falls_back_when_env_vars_unset() {
+        // Ensure env vars are unset
+        std::env::remove_var(GOOSE_ADVERSARY_PROVIDER_ENV);
+        std::env::remove_var(GOOSE_ADVERSARY_MODEL_ENV);
+
+        let session_manager = Arc::new(crate::session::SessionManager::new(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+        ));
+
+        // Should fall back to session/global default (no env vars set)
+        let result = resolve_model_config(&session_manager, "").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_adversary_provider_returns_none_without_env_vars() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let session_manager = Arc::new(crate::session::SessionManager::new(
+            tmp.path().to_path_buf(),
+        ));
+
+        std::env::remove_var(GOOSE_ADVERSARY_PROVIDER_ENV);
+        std::env::remove_var(GOOSE_ADVERSARY_MODEL_ENV);
+
+        let inspector = AdversaryInspector::with_config_dir(
+            session_manager,
+            tmp.path().to_path_buf(),
+        );
+
+        // Without env vars, should return None (will use main provider)
+        assert!(inspector.build_adversary_provider().await.is_none());
     }
 }
