@@ -1,0 +1,41 @@
+FROM alpine:3.24.4 AS builder
+
+COPY goose /usr/local/bin/goose
+RUN chmod 755 /usr/local/bin/goose
+
+FROM alpine:3.24.4
+
+RUN apk add --no-cache \
+    ca-certificates \
+    curl \
+    git \
+    ripgrep \
+    fd \
+    fzf \
+    jq \
+    sudo \
+    zip \
+    unzip \
+    python3 \
+    py3-pip \
+    tree \
+    bash
+
+COPY --from=builder /usr/local/bin/goose /usr/local/bin/goose
+
+RUN addgroup -g 1000 -S goose && \
+    adduser -u 1000 -S goose -G goose -s /bin/bash && \
+    echo "goose ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+RUN git config --global init.defaultBranch main
+
+RUN echo 'alias ll="ls -la"' >> /home/goose/.bashrc && \
+    echo 'alias fd=fdfind' >> /home/goose/.bashrc
+
+WORKDIR /home/goose/workspace
+USER goose
+
+ENV GOOSE_HOME=/home/goose/.goose
+
+ENTRYPOINT ["goose"]
+CMD ["--help"]
